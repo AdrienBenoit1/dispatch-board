@@ -1,0 +1,690 @@
+import React, { useState, useEffect, useCallback } from "react";
+
+// ─────────────────────────────────────────────────────────────
+// DISPATCH BOARD — 35 trucks, 4 terminals in 2 grouped columns
+// Statuses: Available · Staged · On Job · Dead Head · Break
+// Every card shows the driver's current location.
+// ETC = Estimated Time of Completion. Shared across the office.
+// ─────────────────────────────────────────────────────────────
+
+const TERMINALS = ["Lake Charles", "Lafayette", "Sulphur", "Carencro"];
+
+// Two on-screen columns, each holding two terminals
+const COLUMN_GROUPS = [
+  { key: "west", label: "Lake Charles / Sulphur", terminals: ["Lake Charles", "Sulphur"] },
+  { key: "east", label: "Lafayette / Carencro", terminals: ["Lafayette", "Carencro"] },
+];
+
+const STATUS = {
+  AVAILABLE: { label: "Available", color: "#22c55e", bg: "#052e16", ring: "#16a34a" }, // green
+  STAGED:    { label: "Staged",    color: "#94a3b8", bg: "#1e293b", ring: "#64748b" }, // neutral gray
+  ON_JOB:    { label: "On Job",    color: "#60a5fa", bg: "#0a1e3d", ring: "#3b82f6" }, // blue
+  DEAD_HEAD: { label: "Dead Head", color: "#fb923c", bg: "#3a1a06", ring: "#f97316" }, // orange
+  BREAK:     { label: "Break",     color: "#facc15", bg: "#3a2f06", ring: "#eab308" }, // yellow
+};
+// Red is not a status — it's the "late" override applied to any overdue truck.
+const LATE = { color: "#f87171", ring: "#ef4444", bg: "#2a0a0a" };
+
+const STATUS_ORDER = ["AVAILABLE", "STAGED", "ON_JOB", "DEAD_HEAD", "BREAK"];
+
+// Which statuses carry a time + where that time means
+const TIME_STATUSES = ["ON_JOB", "DEAD_HEAD", "BREAK"];
+
+// ─────────────────────────────────────────────────────────────
+// TRUCK TYPES + LIVE ETA QUOTES
+// Each truck has a type. The top panel auto-quotes an ETA per type
+// per side, based on availability:
+//   • A truck of that type Available on that side → base drive time.
+//   • None available → soonest ETC of that type freeing up + drive time.
+//   • None free and none freeing soon → "Call" (lane tapped out).
+// Adjust the base drive minutes per side to match your coverage.
+// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// TRUCK TYPE IS READ FROM THE TRUCK NUMBER (first digit).
+//   0 → Rollback
+//   1 → Equipment Rollback (hauling)
+//   2 → Heavy Duty Rollback
+//   3 → Heavy Duty
+//   4 → Haul
+// Dispatch never picks a type — it comes straight from the unit #.
+// ─────────────────────────────────────────────────────────────
+const TYPE_BY_DIGIT = {
+  "0": "Rollback",
+  "1": "Equip Rollback",
+  "2": "HD Rollback",
+  "3": "Heavy Duty",
+  "4": "Haul",
+};
+// Order the ETA panel shows them in.
+const TRUCK_TYPES = ["Rollback", "Equip Rollback", "HD Rollback", "Heavy Duty", "Haul"];
+
+// Pull the first digit out of a truck number and map it to a type.
+// Handles "Truck 12", "12", "Unit 07", etc. — first digit that appears wins.
+function typeOf(truck) {
+  const m = (truck || "").match(/\d/);
+  if (!m) return "";
+  return TYPE_BY_DIGIT[m[0]] || "";
+}
+
+// ETA quotes: when a truck type is Available on a side, the panel shows "DT"
+// (driver time). Otherwise dispatch types the current ETA in and it persists.
+const STORAGE_KEY = "dispatch:board:v8";
+const ETA_STORAGE_KEY = "dispatch:etas:v8";  // manual ETA quotes, shared
+
+
+// ─────────────────────────────────────────────────────────────
+// SAMSARA LOCATION SYNC (location-only; dispatch keeps all statuses)
+//
+// This is the single hookup point. When you're ready to go live,
+// a small backend / no-code automation (Make.com, Zapier, or a
+// contractor) calls Samsara's GET /fleet/vehicles/locations with
+// your API token and hands the result to applySamsaraLocations().
+// The token must live on that backend — NEVER in this screen's code.
+//
+// Samsara returns each vehicle with a `name` and a reverse-geocoded
+// address string. We match `name` -> truck.samsaraName and drop the
+// address into truck.autoLocation. Statuses/ETC stay dispatch-set.
+//
+// Set SAMSARA_MODE to "live" once your backend endpoint is ready,
+// and point SAMSARA_FEED_URL at it. Leave as "off" for manual use,
+// or "mock" to watch the auto-location mechanism work with fake data.
+// ─────────────────────────────────────────────────────────────
+const SAMSARA_MODE = "off";                 // "off" | "mock" | "live"
+const SAMSARA_FEED_URL = "";                // your backend URL when live
+const SAMSARA_POLL_MS = 30000;              // how often to refresh location
+
+// Given Samsara rows [{ name, address }], merge addresses into units by samsaraName.
+function mergeSamsara(units, rows) {
+  const byName = {};
+  rows.forEach((r) => { if (r.name) byName[r.name.trim().toLowerCase()] = r.address || ""; });
+  return units.map((u) => {
+    const key = (u.samsaraName || u.truck || "").trim().toLowerCase();
+    const addr = byName[key];
+    return addr ? { ...u, autoLocation: addr } : u;
+  });
+}
+
+// What to actually show as the truck's location: auto (Samsara) wins when present.
+function shownLocation(u) {
+  if (u.autoLocation && u.autoLocation.trim()) return { text: u.autoLocation, auto: true };
+  return { text: u.location || "—", auto: false };
+}
+
+// Count a truck's completed calls since midnight today.
+// `calls` is an array of ISO timestamps stamped each time it finishes a run.
+function callsToday(calls) {
+  if (!Array.isArray(calls)) return 0;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const startMs = start.getTime();
+  return calls.filter((t) => new Date(t).getTime() >= startMs).length;
+}
+
+// Did this status change complete a call? On Job → Available/Staged.
+function completedCall(prevStatus, nextStatus) {
+  return prevStatus === "ON_JOB" && (nextStatus === "AVAILABLE" || nextStatus === "STAGED");
+}
+
+// ETA logic (simplified per dispatch):
+//   • A truck of that type is Available on that side → "DT" (driver time).
+//   • Otherwise → whatever ETA dispatch has typed in manually (persisted).
+// manualEta: the stored manual quote string for this type+side (may be empty).
+function etaQuote(units, sideTerminals, type, manualEta) {
+  const pool = units.filter((u) => sideTerminals.includes(u.terminal) && typeOf(u.truck) === type);
+  if (pool.length === 0) return { kind: "none" };                       // no such truck this side
+  const hasAvailable = pool.some((u) => u.status === "AVAILABLE");
+  if (hasAvailable) return { kind: "dt" };                              // ready now → driver time
+  return { kind: "manual", value: manualEta || "" };                    // dispatch sets it
+}
+
+// Demo helper: make N timestamps earlier today so seed cards show a count.
+function seedCalls(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const d = new Date();
+    d.setHours(7 + i, 15, 0, 0); // spread across the morning
+    out.push(d.toISOString());
+  }
+  return out;
+}
+
+const SEED = [
+  { id: "u1", truck: "Truck 04", samsaraName: "Truck 04", driver: "Mike Reyes", terminal: "Lake Charles", status: "AVAILABLE", location: "Yard", autoLocation: "", etc: "", dest: "", calls: seedCalls(3) },
+  { id: "u2", truck: "Truck 31", samsaraName: "Truck 31", driver: "Dana Fontenot", terminal: "Lake Charles", status: "STAGED", location: "I-10 & Ryan", autoLocation: "", etc: "", dest: "", calls: seedCalls(2) },
+  { id: "u3", truck: "Truck 22", samsaraName: "Truck 22", driver: "Carl Boudreaux", terminal: "Lake Charles", status: "ON_JOB", location: "Port of LC", autoLocation: "", etc: "3:40 PM", dest: "", calls: seedCalls(4) },
+  { id: "u4", truck: "Truck 47", samsaraName: "Truck 47", driver: "Roy Guidry", terminal: "Sulphur", status: "AVAILABLE", location: "Yard", autoLocation: "", etc: "", dest: "", calls: seedCalls(1) },
+  { id: "u5", truck: "Truck 40", samsaraName: "Truck 40", driver: "Alia Trahan", terminal: "Sulphur", status: "DEAD_HEAD", location: "Houston, TX", autoLocation: "", etc: "5:30 PM", dest: "Sulphur yard", calls: seedCalls(2) },
+  { id: "u6", truck: "Truck 33", samsaraName: "Truck 33", driver: "Tasha Hebert", terminal: "Lafayette", status: "ON_JOB", location: "Broussard", autoLocation: "", etc: "2:50 PM", dest: "", calls: seedCalls(5) },
+  { id: "u7", truck: "Truck 15", samsaraName: "Truck 15", driver: "Jvia Landry", terminal: "Lafayette", status: "BREAK", location: "Yard", autoLocation: "", etc: "2:15 PM", dest: "", calls: seedCalls(3) },
+  { id: "u8", truck: "Truck 08", samsaraName: "Truck 08", driver: "Ben Cormier", terminal: "Carencro", status: "AVAILABLE", location: "Yard", autoLocation: "", etc: "", dest: "", calls: seedCalls(2) },
+  { id: "u9", truck: "Truck 24", samsaraName: "Truck 24", driver: "Lena Doucet", terminal: "Carencro", status: "DEAD_HEAD", location: "Baton Rouge", autoLocation: "", etc: "4:10 PM", dest: "Carencro yard", calls: seedCalls(1) },
+];
+
+function nowClock() {
+  return new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function parseTime(str) {
+  if (!str) return null;
+  const m = str.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const ap = (m[3] || "").toUpperCase();
+  if (ap === "PM" && h !== 12) h += 12;
+  if (ap === "AM" && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+export default function DispatchBoard() {
+  const [units, setUnits] = useState(SEED);
+  const [etas, setEtas] = useState({});          // { "west|Haul": "45 min", ... }
+  const [etaEdit, setEtaEdit] = useState(null);  // key currently being edited
+  const [etaDraft, setEtaDraft] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [clock, setClock] = useState(nowClock());
+  const [nowMin, setNowMin] = useState(() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); });
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, true);
+        if (res && res.value) setUnits(JSON.parse(res.value));
+      } catch (e) {}
+      try {
+        const er = await window.storage.get(ETA_STORAGE_KEY, true);
+        if (er && er.value) setEtas(JSON.parse(er.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, true);
+        if (res && res.value) {
+          setUnits((cur) => (JSON.stringify(cur) !== res.value ? JSON.parse(res.value) : cur));
+        }
+      } catch (e) {}
+      try {
+        const er = await window.storage.get(ETA_STORAGE_KEY, true);
+        if (er && er.value) {
+          setEtas((cur) => (JSON.stringify(cur) !== er.value ? JSON.parse(er.value) : cur));
+        }
+      } catch (e) {}
+    }, 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setUnits(next);
+    try { await window.storage.set(STORAGE_KEY, JSON.stringify(next), true); }
+    catch (e) { console.error("Save failed", e); }
+  }, []);
+
+  const saveEta = useCallback(async (key, value) => {
+    setEtas((cur) => {
+      const next = { ...cur, [key]: value };
+      window.storage.set(ETA_STORAGE_KEY, JSON.stringify(next), true).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  const commitEtaEdit = () => {
+    if (etaEdit) saveEta(etaEdit, etaDraft.trim());
+    setEtaEdit(null);
+    setEtaDraft("");
+  };
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      setClock(nowClock());
+      const d = new Date();
+      setNowMin(d.getHours() * 60 + d.getMinutes());
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Samsara location sync — pulls addresses and merges them into cards.
+  useEffect(() => {
+    if (SAMSARA_MODE === "off") return;
+
+    async function pull() {
+      let rows = [];
+      try {
+        if (SAMSARA_MODE === "mock") {
+          // Fake feed so you can see auto-location update live in the preview.
+          const mockAddrs = [
+            "I-10 W, Iowa, LA", "Nelson Rd, Lake Charles, LA", "Hwy 90, Broussard, LA",
+            "Ambassador Caffery, Lafayette, LA", "US-171, Moss Bluff, LA", "I-49 N, Carencro, LA",
+          ];
+          rows = SEED.map((s) => ({
+            name: s.samsaraName,
+            address: mockAddrs[Math.floor(Math.random() * mockAddrs.length)],
+          }));
+        } else if (SAMSARA_MODE === "live" && SAMSARA_FEED_URL) {
+          const resp = await fetch(SAMSARA_FEED_URL);
+          const json = await resp.json();
+          // Expecting your backend to return [{ name, address }, ...].
+          rows = Array.isArray(json) ? json : (json.data || []);
+        }
+      } catch (e) {
+        console.error("Samsara pull failed", e);
+        return;
+      }
+      if (rows.length) {
+        setUnits((cur) => {
+          const merged = mergeSamsara(cur, rows);
+          window.storage.set(STORAGE_KEY, JSON.stringify(merged), true).catch(() => {});
+          return merged;
+        });
+      }
+    }
+
+    pull();
+    const t = setInterval(pull, SAMSARA_POLL_MS);
+    return () => clearInterval(t);
+  }, []);
+
+  const openEdit = (u) => { setEditing(u.id); setDraft({ location: "Yard", ...u }); };
+  const openNew = (terminal) => {
+    setEditing("new");
+    setDraft({ id: "u" + Date.now(), truck: "", samsaraName: "", driver: "", terminal: terminal || TERMINALS[0], status: "AVAILABLE", location: "Yard", autoLocation: "", etc: "", dest: "", calls: [] });
+  };
+  const saveDraft = () => {
+    if (!draft.truck.trim()) return;
+    const prev = units.find((u) => u.id === draft.id);
+    let toSave = draft;
+    // Auto-count: On Job → Available/Staged means a call was completed.
+    if (prev && completedCall(prev.status, draft.status)) {
+      const calls = Array.isArray(draft.calls) ? draft.calls : [];
+      toSave = { ...draft, calls: [...calls, new Date().toISOString()] };
+    }
+    const exists = units.some((u) => u.id === draft.id);
+    persist(exists ? units.map((u) => (u.id === draft.id ? toSave : u)) : [...units, toSave]);
+    setEditing(null); setDraft(null);
+  };
+  const removeUnit = () => { persist(units.filter((u) => u.id !== draft.id)); setEditing(null); setDraft(null); };
+
+  const availableCount = units.filter((u) => u.status === "AVAILABLE").length;
+  const deadHeadCount = units.filter((u) => u.status === "DEAD_HEAD").length;
+  const lateCount = units.filter((u) => {
+    if (!TIME_STATUSES.includes(u.status)) return false;
+    const m = parseTime(u.etc);
+    return m !== null && m < nowMin;
+  }).length;
+  const callsTotal = units.reduce((sum, u) => sum + callsToday(u.calls), 0);
+
+  return (
+    <div style={S.root}>
+      <header style={S.header}>
+        <div>
+          <div style={S.title}>DISPATCH BOARD</div>
+          <div style={S.sub}>{units.length} trucks on the clock</div>
+        </div>
+        <div style={S.headStats}>
+          <Stat n={availableCount} label="Available" color={STATUS.AVAILABLE.color} />
+          <Stat n={deadHeadCount} label="Dead Head" color={STATUS.DEAD_HEAD.color} />
+          <Stat n={lateCount} label="Late" color={LATE.color} />
+          <Stat n={callsTotal} label="Calls Today" color="#38bdf8" />
+        </div>
+        <div style={S.clock}>{clock}</div>
+      </header>
+
+      {/* ── ETA quote panel: DT when available, else dispatch-typed ── */}
+      <div style={S.etaPanel}>
+        <div style={S.etaPanelLabel}>
+          <div style={S.etaPanelTitle}>ETA QUOTES</div>
+          <div style={S.etaPanelSub}>DT = driver time · tap to set</div>
+        </div>
+        {COLUMN_GROUPS.map((group) => (
+          <div key={group.key} style={S.etaSide}>
+            <div style={S.etaSideName}>{group.label}</div>
+            <div style={S.etaTypes}>
+              {TRUCK_TYPES.map((type) => {
+                const key = group.key + "|" + type;
+                const q = etaQuote(units, group.terminals, type, etas[key]);
+                const isEditing = etaEdit === key;
+
+                if (q.kind === "none") {
+                  return (
+                    <div key={type} style={{ ...S.etaCell, opacity: 0.5 }}>
+                      <div style={S.etaType}>{type}</div>
+                      <div style={{ ...S.etaValue, color: "#475569" }}>—</div>
+                      <div style={S.etaNote}>no unit</div>
+                    </div>
+                  );
+                }
+                if (q.kind === "dt") {
+                  return (
+                    <div key={type} style={{ ...S.etaCell, borderColor: "#16a34a" }}>
+                      <div style={S.etaType}>{type}</div>
+                      <div style={{ ...S.etaValue, color: "#22c55e" }}>DT</div>
+                      <div style={S.etaNote}>available</div>
+                    </div>
+                  );
+                }
+                // manual
+                return (
+                  <div key={type}
+                    style={{ ...S.etaCell, cursor: "pointer", borderColor: q.value ? "#eab308" : "#7f1d1d" }}
+                    onClick={() => { if (!isEditing) { setEtaEdit(key); setEtaDraft(q.value || ""); } }}>
+                    <div style={S.etaType}>{type}</div>
+                    {isEditing ? (
+                      <input
+                        style={S.etaInput}
+                        value={etaDraft}
+                        autoFocus
+                        onChange={(e) => setEtaDraft(e.target.value)}
+                        onBlur={commitEtaEdit}
+                        onKeyDown={(e) => { if (e.key === "Enter") commitEtaEdit(); if (e.key === "Escape") { setEtaEdit(null); setEtaDraft(""); } }}
+                        onClick={(e) => e.stopPropagation()}
+                        placeholder="ETA" />
+                    ) : (
+                      <div style={{ ...S.etaValue, color: q.value ? "#facc15" : "#f87171" }}>
+                        {q.value || "Set"}
+                      </div>
+                    )}
+                    <div style={S.etaNote}>{q.value ? "none avail" : "tap to set"}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={S.columns}>
+        {COLUMN_GROUPS.map((group) => (
+          <div key={group.key} style={S.column}>
+            <div style={S.groupHead}>{group.label}</div>
+            {group.terminals.map((term) => {
+              const list = units
+                .filter((u) => u.terminal === term)
+                .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status));
+              const avail = list.filter((u) => u.status === "AVAILABLE").length;
+              return (
+                <div key={term} style={S.terminal}>
+                  <div style={S.termHead}>
+                    <div style={S.termName}>{term}</div>
+                    <div style={S.termMeta}>
+                      <span style={{ ...S.termAvail, color: avail > 0 ? STATUS.AVAILABLE.color : "#475569" }}>{avail} avail</span>
+                      <span style={S.termTotal}>· {list.length}</span>
+                      <button style={S.termAdd} onClick={() => openNew(term)}>+</button>
+                    </div>
+                  </div>
+                  <div style={S.termBody}>
+                    {list.length === 0 && <div style={S.empty}>No trucks here</div>}
+                    {list.map((u) => {
+                      const st = STATUS[u.status];
+                      const etcMin = parseTime(u.etc);
+                      const overdue = TIME_STATUSES.includes(u.status) && etcMin !== null && etcMin < nowMin;
+                      // Late override: overdue trucks turn red regardless of status.
+                      const edge = overdue ? LATE.ring : st.ring;
+                      const badgeBg = overdue ? LATE.bg : st.bg;
+                      const badgeColor = overdue ? LATE.color : st.color;
+                      const badgeLabel = overdue ? "LATE · " + st.label : st.label;
+                      return (
+                        <div key={u.id} onClick={() => openEdit(u)}
+                          style={{ ...S.card, borderLeftColor: edge, background: overdue ? LATE.bg : "#0f1523", boxShadow: overdue ? `0 0 0 1px ${LATE.ring}, 0 0 18px ${LATE.ring}55` : "none" }}>
+                          <div style={S.cardTop}>
+                            <div style={S.nameBlock}>
+                              <div style={S.driverName}>{u.driver || "—"}</div>
+                              <div style={S.truckLine}>
+                                <span style={S.truck}>{u.truck}</span>
+                                {typeOf(u.truck) && <span style={S.typeTag}>{typeOf(u.truck)}</span>}
+                              </div>
+                            </div>
+                            <span style={{ ...S.badge, background: badgeBg, color: badgeColor, borderColor: edge }}>{badgeLabel}</span>
+                          </div>
+                          <div style={S.locRow}>
+                            {(() => {
+                              const loc = shownLocation(u);
+                              return (
+                                <>
+                                  {loc.auto
+                                    ? <span style={S.liveDot} title="Live from Samsara" />
+                                    : <span style={S.pin}>📍</span>}
+                                  <span style={{ ...S.loc, color: loc.auto ? "#7dd3fc" : "#94a3b8" }}>{loc.text}</span>
+                                </>
+                              );
+                            })()}
+                          </div>
+
+                          {u.status === "ON_JOB" && (
+                            <div style={{ ...S.timeLine, color: overdue ? "#f87171" : "#fbbf24" }}>
+                              {overdue ? "⚠ " : ""}ETC {u.etc || "—"}
+                            </div>
+                          )}
+                          {u.status === "DEAD_HEAD" && (
+                            <div style={{ ...S.timeLine, color: overdue ? "#f87171" : "#f9a8d4" }}>
+                              {overdue ? "⚠ " : ""}Back {u.etc || "—"}{u.dest ? ` → ${u.dest}` : ""}
+                            </div>
+                          )}
+                          {u.status === "BREAK" && (
+                            <div style={{ ...S.timeLine, color: overdue ? "#f87171" : "#cbd5e1" }}>
+                              {overdue ? "⚠ overdue · " : "Back "}{u.etc || "—"}
+                            </div>
+                          )}
+                          <div style={S.callRow}>
+                            <span style={S.callCount}>{callsToday(u.calls)}</span>
+                            <span style={S.callLabel}>calls today</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      {!loaded && <div style={S.loading}>Loading board…</div>}
+
+      {editing && draft && (
+        <div style={S.overlay} onClick={() => { setEditing(null); setDraft(null); }}>
+          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={S.modalTitle}>{editing === "new" ? "Add Truck" : draft.truck || "Edit Truck"}</div>
+
+            <div style={S.row2}>
+              <Field label="Truck / Unit #">
+                <input style={S.input} value={draft.truck} autoFocus
+                  onChange={(e) => setDraft({ ...draft, truck: e.target.value })} placeholder="Truck 12" />
+              </Field>
+              <Field label="Terminal">
+                <select style={S.input} value={draft.terminal}
+                  onChange={(e) => setDraft({ ...draft, terminal: e.target.value })}>
+                  {TERMINALS.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </Field>
+            </div>
+
+            <Field label="Truck type (auto-detected from unit #)">
+              {typeOf(draft.truck) ? (
+                <div style={S.autoTypeBox}>
+                  <span style={S.autoTypeVal}>{typeOf(draft.truck)}</span>
+                  <span style={S.autoTypeHint}>from first digit of "{draft.truck}"</span>
+                </div>
+              ) : (
+                <div style={S.autoTypeBoxEmpty}>
+                  Enter a unit # starting with 0–4 to set the type
+                </div>
+              )}
+            </Field>
+
+            <Field label="Driver">
+              <input style={S.input} value={draft.driver}
+                onChange={(e) => setDraft({ ...draft, driver: e.target.value })} placeholder="Driver name" />
+            </Field>
+
+            <Field label={draft.autoLocation ? "Current location (live from Samsara)" : "Current location"}>
+              {draft.autoLocation ? (
+                <div style={S.autoLocBox}>
+                  <span style={S.liveDot} />
+                  <span style={S.autoLocText}>{draft.autoLocation}</span>
+                  <button style={S.clearAuto}
+                    onClick={() => setDraft({ ...draft, autoLocation: "" })}>Use manual instead</button>
+                </div>
+              ) : (
+                <input style={S.input} value={draft.location}
+                  onChange={(e) => setDraft({ ...draft, location: e.target.value })} placeholder="Yard, I-10, Houston TX…" />
+              )}
+            </Field>
+
+            <Field label="Samsara vehicle name (for auto-location match)">
+              <input style={S.input} value={draft.samsaraName || ""}
+                onChange={(e) => setDraft({ ...draft, samsaraName: e.target.value })} placeholder="Exact name in Samsara, e.g. Truck 12" />
+            </Field>
+
+            <Field label="Status">
+              <div style={S.statusPicker}>
+                {STATUS_ORDER.map((k) => (
+                  <button key={k}
+                    style={{
+                      ...S.statusOpt,
+                      background: draft.status === k ? STATUS[k].bg : "transparent",
+                      borderColor: draft.status === k ? STATUS[k].ring : "#334155",
+                      color: draft.status === k ? STATUS[k].color : "#94a3b8",
+                    }}
+                    onClick={() => setDraft({ ...draft, status: k })}>
+                    {STATUS[k].label}
+                  </button>
+                ))}
+              </div>
+            </Field>
+
+            {draft.status === "ON_JOB" && (
+              <Field label="ETC — estimated time of completion">
+                <input style={S.input} value={draft.etc}
+                  onChange={(e) => setDraft({ ...draft, etc: e.target.value })} placeholder="3:40 PM" />
+              </Field>
+            )}
+            {draft.status === "DEAD_HEAD" && (
+              <div style={S.row2}>
+                <Field label="Back at terminal (time)">
+                  <input style={S.input} value={draft.etc}
+                    onChange={(e) => setDraft({ ...draft, etc: e.target.value })} placeholder="5:30 PM" />
+                </Field>
+                <Field label="Returning to">
+                  <input style={S.input} value={draft.dest}
+                    onChange={(e) => setDraft({ ...draft, dest: e.target.value })} placeholder="Sulphur yard" />
+                </Field>
+              </div>
+            )}
+            {draft.status === "BREAK" && (
+              <Field label="Back from break at">
+                <input style={S.input} value={draft.etc}
+                  onChange={(e) => setDraft({ ...draft, etc: e.target.value })} placeholder="2:15 PM" />
+              </Field>
+            )}
+
+            <div style={S.modalBtns}>
+              {editing !== "new" && <button style={S.deleteBtn} onClick={removeUnit}>Off clock / Remove</button>}
+              <div style={{ flex: 1 }} />
+              <button style={S.cancelBtn} onClick={() => { setEditing(null); setDraft(null); }}>Cancel</button>
+              <button style={S.saveBtn} onClick={saveDraft}>Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ n, label, color }) {
+  return (
+    <div style={S.headStat}>
+      <span style={{ ...S.headNum, color }}>{n}</span>
+      <span style={S.headLbl}>{label}</span>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 14, flex: 1 }}>
+      <div style={S.fieldLabel}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+const S = {
+  root: { minHeight: "100vh", background: "#0a0e17", color: "#e2e8f0", fontFamily: "'Inter', system-ui, sans-serif", padding: "18px 22px" },
+  header: { display: "flex", alignItems: "center", gap: 28, marginBottom: 18 },
+  title: { fontSize: 32, fontWeight: 800, letterSpacing: "0.08em", color: "#f8fafc" },
+  sub: { fontSize: 14, color: "#64748b", marginTop: 2, fontWeight: 500 },
+  headStats: { display: "flex", gap: 26, marginLeft: 10 },
+  headStat: { display: "flex", flexDirection: "column", alignItems: "center" },
+  headNum: { fontSize: 34, fontWeight: 800, fontVariantNumeric: "tabular-nums", lineHeight: 1 },
+  headLbl: { fontSize: 13, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginTop: 3 },
+  clock: { marginLeft: "auto", fontSize: 38, fontWeight: 700, fontVariantNumeric: "tabular-nums", color: "#38bdf8" },
+  etaPanel: { display: "flex", gap: 14, background: "#0d1119", border: "1px solid #1e293b", borderRadius: 14, padding: "12px 16px", marginBottom: 18, alignItems: "stretch" },
+  etaPanelLabel: { display: "flex", flexDirection: "column", justifyContent: "center", paddingRight: 14, borderRight: "1px solid #1e293b", minWidth: 110 },
+  etaPanelTitle: { fontSize: 17, fontWeight: 800, color: "#f1f5f9", letterSpacing: "0.05em" },
+  etaPanelSub: { fontSize: 12, color: "#64748b", fontWeight: 500, marginTop: 2 },
+  etaSide: { flex: 1, display: "flex", flexDirection: "column", gap: 8 },
+  etaSideName: { fontSize: 13, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.05em" },
+  etaTypes: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 },
+  etaCell: { background: "#131a26", border: "1px solid #1e293b", borderRadius: 9, padding: "8px 6px", textAlign: "center" },
+  etaType: { fontSize: 11, fontWeight: 600, color: "#94a3b8", marginBottom: 3, whiteSpace: "nowrap" },
+  etaValue: { fontSize: 20, fontWeight: 800, fontVariantNumeric: "tabular-nums", lineHeight: 1.1 },
+  etaInput: { width: "100%", background: "#0a0e17", border: "1px solid #eab308", borderRadius: 6, padding: "3px 6px", fontSize: 17, fontWeight: 800, color: "#facc15", textAlign: "center", boxSizing: "border-box", fontVariantNumeric: "tabular-nums" },
+  etaNote: { fontSize: 11, color: "#475569", fontWeight: 500, marginTop: 2 },
+  columns: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, alignItems: "start" },
+  column: { display: "flex", flexDirection: "column", gap: 14 },
+  groupHead: { fontSize: 15, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.08em", paddingLeft: 4 },
+  terminal: { background: "#0d1119", border: "1px solid #1e293b", borderRadius: 14, overflow: "hidden" },
+  termHead: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", background: "#131a26", borderBottom: "1px solid #1e293b" },
+  termName: { fontSize: 19, fontWeight: 800, color: "#f1f5f9" },
+  termMeta: { display: "flex", alignItems: "center", gap: 6 },
+  termAvail: { fontSize: 15, fontWeight: 700 },
+  termTotal: { fontSize: 14, color: "#475569", fontWeight: 600 },
+  termAdd: { marginLeft: 6, width: 26, height: 26, borderRadius: 7, background: "#1e293b", color: "#38bdf8", border: "1px solid #334155", fontSize: 18, fontWeight: 700, cursor: "pointer", lineHeight: 1 },
+  termBody: { padding: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9, minHeight: 70 },
+  empty: { color: "#334155", fontSize: 14, textAlign: "center", padding: "16px 0", fontStyle: "italic", gridColumn: "1 / -1" },
+  card: { borderLeft: "4px solid", borderRadius: 9, padding: "11px 13px", cursor: "pointer", transition: "background 0.15s" },
+  cardTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 5, gap: 6 },
+  nameBlock: { display: "flex", flexDirection: "column", gap: 1 },
+  driverName: { fontSize: 18, fontWeight: 800, color: "#f8fafc", lineHeight: 1.15 },
+  truckLine: { display: "flex", alignItems: "baseline", gap: 7 },
+  truck: { fontSize: 15, fontWeight: 700, color: "#94a3b8" },
+  typeTag: { fontSize: 11, fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.03em" },
+  badge: { fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 6, border: "1px solid", whiteSpace: "nowrap" },
+  driver: { fontSize: 16, fontWeight: 600, color: "#cbd5e1", marginBottom: 4 },
+  locRow: { display: "flex", alignItems: "center", gap: 5 },
+  pin: { fontSize: 13 },
+  liveDot: { width: 9, height: 9, borderRadius: "50%", background: "#38bdf8", boxShadow: "0 0 6px #38bdf8", flexShrink: 0 },
+  loc: { fontSize: 15, color: "#94a3b8", fontWeight: 500 },
+  timeLine: { fontSize: 14, fontWeight: 700, fontVariantNumeric: "tabular-nums", marginTop: 6 },
+  callRow: { display: "flex", alignItems: "baseline", gap: 5, marginTop: 8, paddingTop: 7, borderTop: "1px solid #1e293b" },
+  callCount: { fontSize: 16, fontWeight: 800, color: "#38bdf8", fontVariantNumeric: "tabular-nums" },
+  callLabel: { fontSize: 12, color: "#64748b", fontWeight: 500 },
+  loading: { position: "fixed", bottom: 16, left: 22, color: "#475569", fontSize: 13 },
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 },
+  modal: { background: "#0f1523", border: "1px solid #334155", borderRadius: 16, padding: 26, width: "100%", maxWidth: 500 },
+  modalTitle: { fontSize: 22, fontWeight: 800, marginBottom: 20, color: "#f8fafc" },
+  row2: { display: "flex", gap: 14 },
+  fieldLabel: { fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" },
+  input: { width: "100%", background: "#0a0e17", border: "1px solid #334155", borderRadius: 9, padding: "11px 13px", fontSize: 16, color: "#f8fafc", boxSizing: "border-box" },
+  autoLocBox: { display: "flex", alignItems: "center", gap: 10, background: "#0a1e2e", border: "1px solid #0369a1", borderRadius: 9, padding: "11px 13px" },
+  autoLocText: { flex: 1, fontSize: 16, color: "#7dd3fc", fontWeight: 500 },
+  clearAuto: { background: "transparent", color: "#64748b", border: "1px solid #334155", borderRadius: 7, padding: "5px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" },
+  statusPicker: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6 },
+  statusOpt: { border: "1px solid", borderRadius: 8, padding: "10px 3px", fontSize: 12, fontWeight: 700, cursor: "pointer" },
+  typePicker: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 7 },
+  typeOpt: { border: "1px solid", borderRadius: 8, padding: "10px 4px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  autoTypeBox: { display: "flex", alignItems: "baseline", gap: 10, background: "#0a1e3d", border: "1px solid #3b82f6", borderRadius: 9, padding: "11px 13px" },
+  autoTypeVal: { fontSize: 17, fontWeight: 800, color: "#60a5fa" },
+  autoTypeHint: { fontSize: 12, color: "#64748b", fontWeight: 500 },
+  autoTypeBoxEmpty: { background: "#0a0e17", border: "1px dashed #334155", borderRadius: 9, padding: "11px 13px", fontSize: 14, color: "#64748b", fontStyle: "italic" },
+  modalBtns: { display: "flex", alignItems: "center", gap: 10, marginTop: 20 },
+  deleteBtn: { background: "transparent", color: "#ef4444", border: "1px solid #ef4444", borderRadius: 9, padding: "11px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" },
+  cancelBtn: { background: "transparent", color: "#94a3b8", border: "1px solid #334155", borderRadius: 9, padding: "11px 18px", fontSize: 15, fontWeight: 600, cursor: "pointer" },
+  saveBtn: { background: "#38bdf8", color: "#0a0e17", border: "none", borderRadius: 9, padding: "11px 26px", fontSize: 15, fontWeight: 700, cursor: "pointer" },
+};
